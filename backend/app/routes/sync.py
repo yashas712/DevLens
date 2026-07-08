@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.models.language import Language
 from app.models.repository import Repository
 from app.models.user import User
 
@@ -80,3 +81,63 @@ async def sync_repositories(user_id: int, db: Session = Depends(get_db)):
         )
 
     return {"status": "synced", "repositories_synced": synced_count}
+
+
+@router.post("/sync/languages/{user_id}")
+async def sync_languages(user_id: int, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    repos = db.query(Repository).filter(Repository.user_id == user_id).all()
+    if not repos:
+        raise HTTPException(
+            status_code=400,
+            detail="No repositories found — run /sync/repositories first.",
+        )
+
+    synced_count = 0
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for repo in repos:
+                response = await client.get(
+                    f"https://api.github.com/repositories/{repo.github_repo_id}/languages",
+                    headers={"Authorization": f"Bearer {user.access_token}"},
+                )
+
+                if response.status_code != 200:
+                    continue  # skip this repo, don't kill the whole sync
+
+                language_data = response.json()  # e.g. {"Python": 45000, "HTML": 3000}
+
+                for language, byte_count in language_data.items():
+                    existing = (
+                        db.query(Language)
+                        .filter(
+                            Language.repository_id == repo.id,
+                            Language.language == language,
+                        )
+                        .first()
+                    )
+
+                    if existing:
+                        existing.bytes = byte_count
+                    else:
+                        db.add(
+                            Language(
+                                repository_id=repo.id,
+                                language=language,
+                                bytes=byte_count,
+                            )
+                        )
+                    synced_count += 1
+
+        db.commit()
+
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=504, detail=f"Could not reach GitHub — network issue: {str(e)}"
+        )
+
+    return {"status": "synced", "languages_synced": synced_count}
