@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.models.commit import Commit
 from app.models.language import Language
 from app.models.repository import Repository
 from app.models.user import User
@@ -141,3 +142,68 @@ async def sync_languages(user_id: int, db: Session = Depends(get_db)):
         )
 
     return {"status": "synced", "languages_synced": synced_count}
+
+
+@router.post("/sync/commits/{user_id}")
+async def sync_commits(user_id: int, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    repos = db.query(Repository).filter(Repository.user_id == user_id).all()
+    if not repos:
+        raise HTTPException(
+            status_code=400,
+            detail="No repositories found — run /sync/repositories first.",
+        )
+
+    synced_count = 0
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for repo in repos:
+                response = await client.get(
+                    f"https://api.github.com/repositories/{repo.github_repo_id}/commits",
+                    headers={"Authorization": f"Bearer {user.access_token}"},
+                    params={"per_page": 100},
+                )
+
+                if response.status_code != 200:
+                    continue  # e.g. empty repo with no commits yet — skip, don't fail whole sync
+
+                commits = response.json()
+
+                for c in commits:
+                    sha = c.get("sha")
+                    commit_info = c.get("commit", {})
+                    author_info = commit_info.get("author", {})
+
+                    existing = (
+                        db.query(Commit)
+                        .filter(Commit.repository_id == repo.id, Commit.sha == sha)
+                        .first()
+                    )
+
+                    if existing:
+                        continue  # commits are immutable — no need to update, just skip
+
+                    db.add(
+                        Commit(
+                            repository_id=repo.id,
+                            sha=sha,
+                            author_name=author_info.get("name"),
+                            author_email=author_info.get("email"),
+                            message=commit_info.get("message"),
+                            committed_at=author_info.get("date"),
+                        )
+                    )
+                    synced_count += 1
+
+        db.commit()
+
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=504, detail=f"Could not reach GitHub — network issue: {str(e)}"
+        )
+
+    return {"status": "synced", "commits_synced": synced_count}
