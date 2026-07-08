@@ -1,11 +1,12 @@
 from fastapi import FastAPI
 
 from app.config import settings
-from app.routes import auth, sync
+from app.routes import auth, score, sync
 
 app = FastAPI(title="DevLens API")
 app.include_router(auth.router)
 app.include_router(sync.router)
+app.include_router(score.router)
 
 
 @app.get("/")
